@@ -16,6 +16,36 @@ let ws = null;
 let reconnecting = false;
 let messageCount = 0;
 
+// ==========================================================
+// Dedup memory
+// เก็บ id ของ event ที่ "ส่งออกไปแล้ว" (ผ่าน output.send สำเร็จ)
+// ตัวแปรนี้อยู่ระดับ module -> ไม่ถูก reset ตอน reconnect (connect() ถูกเรียกใหม่)
+// จะถูก reset ก็ต่อเมื่อ process รันใหม่ทั้งหมดเท่านั้น
+//
+// ใช้ Set + Array คู่กันเพื่อ: เช็คซ้ำเร็ว (Set) และ จำกัดขนาดไม่ให้บวมไม่รู้จบ (Array เป็น FIFO)
+// ==========================================================
+const sentIds = new Set();
+const sentIdsOrder = [];
+const MAX_SENT_IDS = 20000; // เก็บ id ล่าสุดไว้ประมาณนี้ พอสำหรับกันซ้ำตอน reconnect สั้นๆ
+
+function alreadySent(id) {
+  if (!id) return false; // ไม่มี id ที่เชื่อถือได้ -> ส่งไปเลย ไม่กันซ้ำ
+  return sentIds.has(id);
+}
+
+function markSent(id) {
+  if (!id) return;
+  if (sentIds.has(id)) return;
+
+  sentIds.add(id);
+  sentIdsOrder.push(id);
+
+  if (sentIdsOrder.length > MAX_SENT_IDS) {
+    const oldest = sentIdsOrder.shift();
+    sentIds.delete(oldest);
+  }
+}
+
 function maskKey(key) {
   if (!key) return "(empty)";
   if (key.length <= 8) return "*".repeat(key.length);
@@ -101,22 +131,52 @@ function connect() {
   });
 }
 
+// ตัดฟิลด์ที่รู้อยู่แล้วว่า "ไม่ได้ใช้" ในระบบนี้เลย แต่ตัวเปลืองพื้นที่ log มากที่สุด
+// เช่น profilePicture.url / giftImage / badge icon ฯลฯ ที่เป็น signed CDN URL ยาวๆ
+// (ไม่กระทบข้อมูลจริงที่ส่งออกไปปลายทาง - ใช้แค่สำหรับ log preview เท่านั้น)
+const NOISY_KEYS = new Set(["url", "urllist", "avatarthumb", "avatarmedium", "avatarlarge"]);
+
+function sanitizeForLog(value) {
+  if (Array.isArray(value)) {
+    if (value.length > 0 && typeof value[0] === "string" && value[0].length > 60) {
+      return `[${value.length} url(s) omitted]`;
+    }
+    return value.map(sanitizeForLog);
+  }
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, val] of Object.entries(value)) {
+      if (NOISY_KEYS.has(key.toLowerCase())) {
+        out[key] = Array.isArray(val) ? `[${val.length} url(s) omitted]` : "[omitted]";
+      } else {
+        out[key] = sanitizeForLog(val);
+      }
+    }
+    return out;
+  }
+  if (typeof value === "string" && value.length > 300) {
+    return `${value.slice(0, 100)}...(${value.length} chars, truncated)`;
+  }
+  return value;
+}
+
 function handleMessage(raw) {
   messageCount += 1;
   const rawStr = raw.toString();
 
-  // Log ข้อความดิบทุกอันที่ได้รับ (ตัดให้สั้นถ้ายาวเกิน เพื่อไม่ให้ log ท่วม)
-  const preview = rawStr.length > 1000 ? `${rawStr.slice(0, 1000)}...(truncated)` : rawStr;
-  console.log(`[gateway] [recv #${messageCount}] ${preview}`);
-
   let parsed;
-
   try {
     parsed = JSON.parse(rawStr);
   } catch (err) {
     console.error("[gateway] Failed to parse message JSON:", err.message);
     return;
   }
+
+  // Log ข้อความดิบทุกอันที่ได้รับ แบบตัดฟิลด์รกๆ (url รูปภาพ ฯลฯ) ออกก่อน
+  // เพื่อไม่ให้ log ท่วมด้วยข้อมูลที่ไม่ได้ใช้งานจริง
+  let preview = JSON.stringify(sanitizeForLog(parsed));
+  if (preview.length > 1000) preview = `${preview.slice(0, 1000)}...(truncated)`;
+  console.log(`[gateway] [recv #${messageCount}] ${preview}`);
 
   // EulerStream ส่งมาได้หลายแบบ ขึ้นกับ feature flag / เวอร์ชัน:
   //   1) { messages: [ {...}, {...} ] }   <- รูปแบบมาตรฐานของ ws.eulerstream.com
@@ -135,10 +195,21 @@ function handleMessage(raw) {
 
   for (const rawEvent of rawEvents) {
     const normalized = normalize(rawEvent);
+
+    // กันส่งซ้ำ: ถ้า event นี้เคยถูกส่งออกไปแล้ว (เช่นตอนก่อน reconnect) ให้ข้าม
+    if (alreadySent(normalized.id)) {
+      console.log(
+        `[gateway] [event] type=${normalized.event} id=${normalized.id} skipped (duplicate, already sent before)`
+      );
+      continue;
+    }
+
     const allowed = isAllowed(normalized);
+    const rawTypeHint =
+      normalized.event === "unknown" ? ` rawType=${rawEvent && (rawEvent.type || rawEvent.event)}` : "";
 
     console.log(
-      `[gateway] [event] type=${normalized.event} allowed=${allowed}${
+      `[gateway] [event] type=${normalized.event}${rawTypeHint} id=${normalized.id || "(no id)"} allowed=${allowed}${
         allowed ? "" : " (filtered out by config.filter)"
       }`
     );
@@ -148,6 +219,7 @@ function handleMessage(raw) {
     }
 
     output.send(normalized);
+    markSent(normalized.id);
   }
 }
 
