@@ -7,6 +7,7 @@
 // ==========================================================
 
 const WebSocket = require("ws");
+require("./logger"); // ต้อง require ก่อนตัวอื่นเพื่อให้ patch console.log/error ทันเวลา
 const config = require("./config");
 const { normalize } = require("./normalize");
 const { isAllowed } = require("./filter");

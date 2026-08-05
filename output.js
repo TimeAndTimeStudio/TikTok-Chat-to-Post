@@ -6,7 +6,14 @@
 
 const config = require("./config");
 
-async function send(normalizedEvent) {
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000; // ระหว่างครั้งที่ retry แต่ละครั้ง (คูณเพิ่มแบบ backoff ง่ายๆ)
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendOnce(normalizedEvent) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.output.timeoutMs);
 
@@ -19,12 +26,32 @@ async function send(normalizedEvent) {
     });
 
     if (!res.ok) {
-      console.error(`[output] HTTP ${res.status} ${res.statusText}`);
+      throw new Error(`HTTP ${res.status} ${res.statusText}`);
     }
-  } catch (err) {
-    console.error(`[output] Failed to send event "${normalizedEvent.event}":`, err.message);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function send(normalizedEvent) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
+    try {
+      await sendOnce(normalizedEvent);
+      return;
+    } catch (err) {
+      const isLastAttempt = attempt === MAX_RETRIES;
+      console.error(
+        `[output] Failed to send event "${normalizedEvent.event}" (attempt ${attempt}/${MAX_RETRIES}):`,
+        err.message
+      );
+
+      if (isLastAttempt) {
+        console.error(`[output] Giving up on event "${normalizedEvent.event}" after ${MAX_RETRIES} attempts`);
+        return;
+      }
+
+      await sleep(RETRY_DELAY_MS * attempt);
+    }
   }
 }
 
